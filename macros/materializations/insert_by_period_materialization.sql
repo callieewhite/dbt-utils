@@ -3,14 +3,19 @@
   {% call statement('period_boundaries', fetch_result=True) -%}
     with data as (
       select
-          coalesce(max("{{timestamp_field}}"), '{{start_date}}')::timestamp as start_timestamp,
+          coalesce(max({{timestamp_field}}), {{start_date}})::timestamp as start_timestamp,
           coalesce(
             {{dbt_utils.dateadd('millisecond',
                                 -1,
-                                "nullif('" ~ stop_date ~ "','')::timestamp")}},
-            {{dbt_utils.current_timestamp()}}
-          ) as stop_timestamp
-      from "{{target_schema}}"."{{target_table}}"
+                                "iff('" ~ stop_date ~ "' = 'NULL', NULL, " ~ stop_date ~ ")::timestamp")
+            }},
+            {{dbt_utils.dateadd('millisecond',
+                                -1,
+                                dbt_utils.date_trunc(period, dbt_utils.current_timestamp())
+                                )
+            }}
+          )::timestamp as stop_timestamp
+      from {{target_schema}}.{{target_table}}
     )
 
     select
@@ -27,9 +32,9 @@
 {% macro get_period_sql(target_cols_csv, sql, timestamp_field, period, start_timestamp, stop_timestamp, offset) -%}
 
   {%- set period_filter -%}
-    ("{{timestamp_field}}" >  '{{start_timestamp}}'::timestamp + interval '{{offset}} {{period}}' and
-     "{{timestamp_field}}" <= '{{start_timestamp}}'::timestamp + interval '{{offset}} {{period}}' + interval '1 {{period}}' and
-     "{{timestamp_field}}" <  '{{stop_timestamp}}'::timestamp)
+    ({{timestamp_field}} >  '{{start_timestamp}}'::timestamp + interval '{{offset}} {{period}}' and
+     {{timestamp_field}} <= '{{start_timestamp}}'::timestamp + interval '{{offset}} {{period}}' + interval '1 {{period}}' and
+     {{timestamp_field}} <  '{{stop_timestamp}}'::timestamp)
   {%- endset -%}
 
   {%- set filtered_sql = sql | replace("__PERIOD_FILTER__", period_filter) -%}
@@ -42,11 +47,27 @@
 
 {%- endmacro %}
 
-{% materialization insert_by_period, default -%}
+{% materialization snowflake_insert_by_period, adapter='snowflake' -%}
   {%- set timestamp_field = config.require('timestamp_field') -%}
-  {%- set start_date = config.require('start_date') -%}
-  {%- set stop_date = config.get('stop_date') or '' -%}}
-  {%- set period = config.get('period') or 'week' -%}
+  {%- set dev_datepart = config.get('dev_datepart') -%}
+  {%- set dev_lookback_periods = config.get('dev_lookback_periods') -%}
+  {%- set dev_stop_time = dbt_utils.dateadd(datepart='day', interval="-2", from_date_or_timestamp=dbt_utils.current_timestamp()) -%}
+
+  {% if target.name == 'dev' and dev_datepart and dev_lookback_periods %}
+    {%- set start_date = dbt_utils.dateadd(datepart=dev_datepart, interval="-" ~ dev_lookback_periods, from_date_or_timestamp=dev_stop_time) -%}
+  {% elif target.name == 'dev' %}
+    {%- set start_date = dbt_utils.dateadd(datepart='hour', interval="-1", from_date_or_timestamp=dev_stop_time) -%}
+  {% else %}
+    {%- set start_date = "'" ~ config.require('start_date') ~ "'" -%}
+  {% endif %}
+
+  {% if target.name == 'dev' %}
+    {%- set stop_date = dev_stop_time -%}
+  {% else %}
+    {%- set stop_date = config.get('stop_date') or 'NULL' -%}
+  {% endif %}
+
+  {%- set period = config.get('period') or 'day' -%}
 
   {%- if sql.find('__PERIOD_FILTER__') == -1 -%}
     {%- set error_message -%}
@@ -61,7 +82,12 @@
   {%- set target_relation = api.Relation.create(identifier=identifier, schema=schema, type='table') -%}
 
   {%- set non_destructive_mode = (flags.NON_DESTRUCTIVE == True) -%}
-  {%- set full_refresh_mode = (flags.FULL_REFRESH == True) -%}
+
+  {% if target.name == 'dev' and dev_datepart and dev_lookback_periods %}
+    {%- set full_refresh_mode = True -%}
+  {% else %}
+    {%- set full_refresh_mode = (flags.FULL_REFRESH == True) -%}
+  {% endif %}
 
   {%- set exists_as_table = (old_relation is not none and old_relation.is_table) -%}
   {%- set exists_not_as_table = (old_relation is not none and not old_relation.is_table) -%}
@@ -94,11 +120,11 @@
     {# Create an empty target table -#}
     {% call statement('main') -%}
       {%- set empty_sql = sql | replace("__PERIOD_FILTER__", 'false') -%}
-      {{create_table_as(False, target_relation, empty_sql)}};
+      {{create_table_as(False, target_relation, empty_sql)}}
     {%- endcall %}
   {%- endif %}
 
-  {% set _ = dbt_utils.get_period_boundaries(schema,
+  {% set _ = snaptravel.get_period_boundaries(schema,
                                               identifier,
                                               timestamp_field,
                                               start_date,
@@ -108,20 +134,23 @@
   {%- set stop_timestamp = load_result('period_boundaries')['data'][0][1] | string -%}
   {%- set num_periods = load_result('period_boundaries')['data'][0][2] | int -%}
 
+  {%- set msg = "Start timestamp for " ~ target_relation.identifier ~ ": " ~ start_timestamp ~ "\nStop timestamp for " ~ target_relation.identifier ~ ": " ~ stop_timestamp ~ "\nNo. of periods: " ~ num_periods -%}
+  {{ dbt_utils.log_info(msg) }}
+
   {% set target_columns = adapter.get_columns_in_relation(target_relation) %}
   {%- set target_cols_csv = target_columns | map(attribute='quoted') | join(', ') -%}
   {%- set loop_vars = {'sum_rows_inserted': 0} -%}
 
   -- commit each period as a separate transaction
   {% for i in range(num_periods) -%}
-    {%- set msg = "Running for " ~ period ~ " " ~ (i + 1) ~ " of " ~ (num_periods) -%}
+    {%- set msg = "Running " ~ target_relation.identifier ~ " for " ~ period ~ " " ~ (i + 1) ~ " of " ~ (num_periods) -%}
     {{ dbt_utils.log_info(msg) }}
 
     {%- set tmp_identifier = model['name'] ~ '__dbt_incremental_period' ~ i ~ '_tmp' -%}
     {%- set tmp_relation = api.Relation.create(identifier=tmp_identifier,
                                                schema=schema, type='table') -%}
     {% call statement() -%}
-      {% set tmp_table_sql = dbt_utils.get_period_sql(target_cols_csv,
+      {% set tmp_table_sql = snaptravel.get_period_sql(target_cols_csv,
                                                        sql,
                                                        timestamp_field,
                                                        period,
@@ -142,11 +171,11 @@
           from {{tmp_relation.include(schema=False)}}
       );
     {%- endcall %}
-    {%- set rows_inserted = (load_result('main-' ~ i)['status'].split(" "))[2] | int -%}
+    {%- set rows_inserted = (load_result('main-' ~ i)['status'].split(" "))[1] | int -%}
     {%- set sum_rows_inserted = loop_vars['sum_rows_inserted'] + rows_inserted -%}
     {%- if loop_vars.update({'sum_rows_inserted': sum_rows_inserted}) %} {% endif -%}
 
-    {%- set msg = "Ran for " ~ period ~ " " ~ (i + 1) ~ " of " ~ (num_periods) ~ "; " ~ rows_inserted ~ " records inserted" -%}
+    {%- set msg = "Ran " ~ target_relation.identifier ~ " for " ~ period ~ " " ~ (i + 1) ~ " of " ~ (num_periods) ~ "; " ~ rows_inserted ~ " records inserted" -%}
     {{ dbt_utils.log_info(msg) }}
 
   {%- endfor %}
@@ -170,6 +199,6 @@
   {%- endcall %}
 
   -- Return the relations created in this materialization
-  {{ return({'relations': [target_relation]}) }}  
+  {{ return({'relations': [target_relation]}) }}
 
 {%- endmaterialization %}
